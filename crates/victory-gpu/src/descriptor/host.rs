@@ -4522,7 +4522,7 @@ fn kin(old: &View, new: &View) -> Kin {
     }
 }
 
-fn default_srv_for_desc(
+pub(crate) fn default_srv_for_desc(
     own: &D3D12_RESOURCE_DESC,
     format: u32,
 ) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -4595,7 +4595,7 @@ fn default_srv_for_desc(
     out
 }
 
-fn default_uav_for_desc(
+pub(crate) fn default_uav_for_desc(
     own: &D3D12_RESOURCE_DESC,
     format: u32,
 ) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {

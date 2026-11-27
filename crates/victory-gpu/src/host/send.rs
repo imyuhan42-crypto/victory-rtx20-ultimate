@@ -74,12 +74,13 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-struct Pass {
-    root: ID3D12RootSignature,
-    pso: ID3D12PipelineState,
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct Pass {
+    pub(super) root: ID3D12RootSignature,
+    pub(super) pso: ID3D12PipelineState,
 }
 
-fn pass(host: &Host) -> Option<&'static Pass> {
+pub(super) fn pass(host: &Host) -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let code = compile(SCATTER, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
@@ -188,9 +189,9 @@ pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync:
 
 /// One copy's sends: ranges copied (offset in the copy, in the memory,
 /// bytes), and its pairs (where in the memory, how many).
-struct Copy {
-    runs: Vec<(usize, u64, usize)>,
-    pairs: (u64, u32),
+pub(super) struct Copy {
+    pub(super) runs: Vec<(usize, u64, usize)>,
+    pub(super) pairs: (u64, u32),
 }
 
 /// Where a submission's bytes are taken to.
@@ -202,16 +203,15 @@ pub(super) struct Own {
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
-struct ChunkSpan {
-    dirty_idx: usize,
-    start_idx: usize,
-    end_idx: usize,
-    words: usize,
-    rel_offset: u64,
+pub(super) struct ChunkSpan {
+    pub(super) dirty_idx: usize,
+    pub(super) start_idx: usize,
+    pub(super) end_idx: usize,
+    pub(super) rel_offset: u64,
 }
 
 /// Lays out copy runs and scatter word pairs for each dirty buffer without overlapping regions.
-fn plan_layout<'a>(
+pub(super) fn plan_layout<'a>(
     dirty_ranges: impl IntoIterator<Item = &'a [(usize, usize)]>,
 ) -> (u64, Vec<Copy>, Vec<ChunkSpan>) {
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
@@ -242,7 +242,6 @@ fn plan_layout<'a>(
                         dirty_idx,
                         start_idx: chunk_start,
                         end_idx: idx + 1,
-                        words: chunk_words,
                         rel_offset: chunk_rel_offset,
                     });
                     chunk_words = 0;
@@ -402,9 +401,15 @@ mod tests {
 
         // Pair chunk offsets must sit inside `[copy.pairs.0, copy.pairs.0 + pairs.1 * 8)` with no overlap into `runs`.
         assert_eq!(chunks.len(), 2);
+        let all = [&ranges0[..], &ranges1[..]];
         for span in &chunks {
+            let chunk_words: usize = all[span.dirty_idx][span.start_idx..span.end_idx]
+                .iter()
+                .filter(|&&(a, b)| short(a, b - a))
+                .map(|&(a, b)| (b - a) / 4)
+                .sum();
             let start = copies[span.dirty_idx].pairs.0 + span.rel_offset;
-            let end = start + span.words as u64 * 8;
+            let end = start + chunk_words as u64 * 8;
             for &(_, run_at, run_len) in &copies[span.dirty_idx].runs {
                 assert!(end <= run_at || start >= run_at + run_len as u64);
             }
