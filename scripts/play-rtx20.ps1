@@ -41,12 +41,21 @@ if ($Fullscreen) {
     $env:VICTORY_FULLSCREEN = "0"
 }
 
-$argsList = @("--console", $ConsoleProfile, "--execute")
-if (-not [string]::IsNullOrWhiteSpace($GamePath)) {
-    $argsList = @($GamePath) + $argsList
+if ([string]::IsNullOrWhiteSpace($GamePath) -and -not [string]::IsNullOrWhiteSpace($env:VICTORY_GAME_DIR)) {
+    $GamePath = Join-Path $env:VICTORY_GAME_DIR "game_scarlett_master.exe"
 }
+if ([string]::IsNullOrWhiteSpace($GamePath)) {
+    throw "Specify -GamePath <path-to-game_scarlett_master.exe> or set VICTORY_GAME_DIR."
+}
+
+$argsList = @("run", $GamePath, "--console", $ConsoleProfile, "--execute")
 
 Write-Host "[VIctory RTX20] Exe: $ExePath"
 Write-Host "[VIctory RTX20] Profile: $ConsoleProfile | VICTORY_VIEW_THREADS=$($env:VICTORY_VIEW_THREADS)"
-& $ExePath @argsList
+Push-Location $RepoRoot
+try {
+    & $ExePath @argsList
+} finally {
+    Pop-Location
+}
 
