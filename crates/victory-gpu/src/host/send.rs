@@ -202,23 +202,28 @@ pub(super) struct Own {
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
-/// Takes what `dirty` sends up out of the CPU sides.
-pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
-    let began = std::time::Instant::now();
-    pass(host)?;
-    // Runs of whole words of the copy: only those are pairs. (A byte beside
-    // them in a word may be the card's.)
+struct ChunkSpan {
+    dirty_idx: usize,
+    start_idx: usize,
+    end_idx: usize,
+    words: usize,
+    rel_offset: u64,
+}
+
+/// Lays out copy runs and scatter word pairs for each dirty buffer without overlapping regions.
+fn plan_layout<'a>(
+    dirty_ranges: impl IntoIterator<Item = &'a [(usize, usize)]>,
+) -> (u64, Vec<Copy>, Vec<ChunkSpan>) {
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
-    let mut copies = Vec::with_capacity(dirty.len());
-    let mut total_runs = 0usize;
-    let mut chunk_spans: Vec<(usize, usize, usize, usize, u64)> = Vec::new();
-    for (dirty_idx, (_, ranges)) in dirty.iter().enumerate() {
+    let mut copies = Vec::new();
+    let mut chunk_spans = Vec::new();
+    for (dirty_idx, ranges) in dirty_ranges.into_iter().enumerate() {
         let mut runs = Vec::new();
         let mut words = 0usize;
         let mut chunk_words = 0usize;
         let mut chunk_start = 0usize;
-        let mut chunk_offset = at;
+        let mut chunk_rel_offset = 0u64;
         for (idx, &(a, b)) in ranges.iter().enumerate() {
             if !short(&(a, b)) {
                 runs.push((a, at, b - a));
@@ -226,26 +231,43 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             } else {
                 let w = (b - a) / 4;
                 if w > 0 && chunk_words == 0 {
-                    chunk_offset = at + words as u64 * 8;
+                    chunk_rel_offset = words as u64 * 8;
                 }
                 words += w;
                 chunk_words += w;
             }
             if idx + 1 - chunk_start == RUNS_AT_A_TIME || idx + 1 == ranges.len() {
                 if chunk_words > 0 {
-                    chunk_spans.push((dirty_idx, chunk_start, idx + 1, chunk_words, chunk_offset));
+                    chunk_spans.push(ChunkSpan {
+                        dirty_idx,
+                        start_idx: chunk_start,
+                        end_idx: idx + 1,
+                        words: chunk_words,
+                        rel_offset: chunk_rel_offset,
+                    });
                     chunk_words = 0;
                 }
                 chunk_start = idx + 1;
             }
         }
-        total_runs += runs.len();
         copies.push(Copy { runs, pairs: (at, words as u32) });
         at += (words as u64 * 8).next_multiple_of(16);
     }
+    (at, copies, chunk_spans)
+}
+
+/// Takes what `dirty` sends up out of the CPU sides.
+pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
+    let began = std::time::Instant::now();
+    pass(host)?;
+    // Runs of whole words of the copy: only those are pairs. (A byte beside
+    // them in a word may be the card's.)
+    let short = |&(a, b): &(usize, usize)| short(a, b - a);
+    let (at, copies, chunk_spans) = plan_layout(dirty.iter().map(|(_, ranges)| ranges.as_slice()));
     if at == 0 {
         return None;
     }
+    let total_runs: usize = copies.iter().map(|c| c.runs.len()).sum();
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::with_capacity(total_runs);
     let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::with_capacity(chunk_spans.len());
@@ -253,11 +275,11 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
     }
-    for (dirty_idx, start_idx, end_idx, _chunk_words, rel_to) in chunk_spans {
-        let (shadow, ranges) = &dirty[dirty_idx];
+    for span in chunk_spans {
+        let (shadow, ranges) = &dirty[span.dirty_idx];
         let from = shadow.card_data() as usize;
-        let to = memory.data + rel_to as usize;
-        work.push((from, &ranges[start_idx..end_idx], to));
+        let to = memory.data + copies[span.dirty_idx].pairs.0 as usize + span.rel_offset as usize;
+        work.push((from, &ranges[span.start_idx..span.end_idx], to));
     }
     let one = |i: usize| {
         let (from, ranges, to) = work[i];
@@ -357,5 +379,37 @@ impl Own {
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
         self.memory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_short_and_long_dirty_ranges_place_pairs_after_runs() {
+        let ranges0 = [(0usize, 8usize), (16, 400), (500, 504)];
+        let ranges1 = [(0usize, 12usize), (64, 512)];
+        let (total, copies, chunks) = plan_layout([&ranges0[..], &ranges1[..]]);
+
+        // Copy 0 has one long run (384 bytes -> aligned to 384 at offset 0) and 3 words of pairs at 384..408 -> aligned 416.
+        assert_eq!(copies[0].runs, vec![(16, 0, 384)]);
+        assert_eq!(copies[0].pairs, (384, 3));
+        // Copy 1 starts at 416 with its long run (448 bytes at 416..864), then 3 words of pairs at 864..888 -> aligned 896.
+        assert_eq!(copies[1].runs, vec![(64, 416, 448)]);
+        assert_eq!(copies[1].pairs, (864, 3));
+        assert_eq!(total, 896);
+
+        // Pair chunk offsets must sit inside `[copy.pairs.0, copy.pairs.0 + pairs.1 * 8)` with no overlap into `runs`.
+        assert_eq!(chunks.len(), 2);
+        for span in &chunks {
+            let start = copies[span.dirty_idx].pairs.0 + span.rel_offset;
+            let end = start + span.words as u64 * 8;
+            for &(_, run_at, run_len) in &copies[span.dirty_idx].runs {
+                assert!(end <= run_at || start >= run_at + run_len as u64);
+            }
+            assert!(start >= copies[span.dirty_idx].pairs.0);
+            assert!(end <= copies[span.dirty_idx].pairs.0 + u64::from(copies[span.dirty_idx].pairs.1) * 8);
+        }
     }
 }

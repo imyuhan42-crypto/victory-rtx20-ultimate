@@ -2552,12 +2552,13 @@ fn host_texture_as(
     {
         d.format = typeless;
     }
-    // The host has no sRGB unordered access and requires typeless backing for
-    // sRGB <-> linear view casting on filled, render-target, and UAV textures
-    // (including BC1/2/3/7 and RGBA8/BGRA8 targets).
-    if (fills(desc) || d.flags & (TARGET | UNORDERED) != 0)
-        && SRGB.iter().any(|&(srgb, linear)| srgb == d.format || linear == d.format)
-    {
+    // The host has no sRGB unordered access and needs typeless backing for
+    // sRGB <-> linear view casting on streamed/filled asset textures and
+    // unordered-access sRGB textures (without making plain render targets typeless).
+    let needs_srgb_typeless = (fills(desc)
+        && SRGB.iter().any(|&(srgb, linear)| srgb == d.format || linear == d.format))
+        || (d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format));
+    if needs_srgb_typeless {
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth

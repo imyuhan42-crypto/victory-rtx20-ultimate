@@ -2819,19 +2819,18 @@ pub(crate) fn let_go_idle() {
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
-            Vec::new()
-        } else {
-            let idle: Vec<(u64, u64)> = map
-                .iter()
-                .filter(|(_, s)| {
-                    Arc::strong_count(s) == 1
-                        && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                        && crate::host::references(&s.buffer) == 1
-                })
-                .map(|(key, _)| *key)
-                .collect();
-            idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+            return;
         }
+        let idle: Vec<(u64, u64)> = map
+            .iter()
+            .filter(|(_, s)| {
+                Arc::strong_count(s) == 1
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                    && crate::host::references(&s.buffer) == 1
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -2845,43 +2844,6 @@ pub(crate) fn let_go_idle() {
         // Nothing runs now and nothing names it: freed at once unless a
         // submission is running after all.
         crate::host::retire(shadow);
-    }
-
-    // Reclaim idle registered buffer shadows that are unreferenced by any list,
-    // descriptor slot, or in-flight write, without dirtying BUFFERS_CHANGED unless
-    // at least one entry actually qualifies.
-    let can_evict = |s: &Arc<Shadow>| {
-        Arc::strong_count(s) == 1
-            && !s.writes_pending()
-            && s.card_dirty_now().is_empty()
-            && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-            && crate::host::references(&s.buffer) == 1
-    };
-    let any_idle = buffers_read().values().any(|e| e.shadow.as_ref().is_some_and(can_evict));
-    if any_idle {
-        let taken: Vec<Arc<Shadow>> = {
-            let mut map = buffers();
-            map.values_mut()
-                .filter_map(|e| {
-                    if e.shadow.as_ref().is_some_and(can_evict) {
-                        e.shadow.take()
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-        if !taken.is_empty() {
-            let (went, bytes) = (taken.len(), taken.iter().map(|s| s.len).sum::<u64>());
-            crate::host::trail(|| {
-                format!("sweep: {went} host copies of idle buffers let go ({} KiB)", bytes >> 10)
-            });
-            for shadow in taken {
-                LET_GO[0].fetch_add(1, Ordering::Relaxed);
-                LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
-                crate::host::retire(shadow);
-            }
-        }
     }
 }
 

@@ -13,14 +13,14 @@ An optimized Windows Direct3D 12 compatibility runtime and RDNA 2-to-DXIL shader
 - **Fix:**
   - Scaled texture residency floors (`256 MiB` on `<= 6.5 GiB` VRAM, `512 MiB` on `<= 9 GiB`, `1024 MiB` on `<= 12 GiB`) and target headroom (`1280 MiB` on 6 GB, `2048 MiB` on 8 GB, `3072 MiB` on higher VRAM) using live DXGI local video memory queries and in-flight upload byte tracking (`PendingTextureGuard` in `crates/victory-gpu/src/resource.rs`).
   - Enabled on-demand tiled mip allocation (`VICTORY_LEVELS_ON_DEMAND`, on by default) so streamed textures commit only actively viewed mip levels (`crates/victory-gpu/src/tiles.rs`).
-  - Scaled staging pool lookahead, idle pool retention, and GPU-local card copy limits to reported VRAM capacity (`crates/victory-gpu/src/pool.rs`, `crates/victory-gpu/src/shadow.rs`), and added idle registered buffer copy reclamation (`let_go_idle`).
+  - Scaled staging pool lookahead, idle pool retention, and GPU-local card copy limits to reported VRAM capacity (`crates/victory-gpu/src/pool.rs`, `crates/victory-gpu/src/shadow.rs`).
 
 ### 2. Wrong Texture Bindings, Descriptor Heap Limits, and sRGB Format Mismatches
-- **Problem:** Reused bindless descriptor slots could temporarily display an unrelated previously bound texture on another mesh (for example, UI or gauge textures appearing on character faces). On NVIDIA drivers with a 1,000,000-slot view heap limit, reserving only `2^18` dynamic slots exhausted per-draw descriptor space in heavy scenes. Additionally, explicit sRGB/linear view casts on filled textures and render targets lacked typeless backing and concrete footprint handling.
+- **Problem:** Reused bindless descriptor slots could lag behind streaming uploads or miss explicit sRGB/linear view casts on filled and unordered-access textures. On NVIDIA drivers with a 1,000,000-slot view heap limit, preserving headroom for ~720k long-lived title views is required alongside dynamic per-draw tables.
 - **Fix:**
-  - Restricted unready slot retention strictly to identical underlying resources (`VICTORY_KEEP_SHOWN=0` by default, `Kin::Same` only) so stale textures never bleed across reused slots, and enabled async ahead-of-draw texture uploads (`VICTORY_UPLOAD_AHEAD`, `VICTORY_TEXTURE_NO_WAIT`, `VICTORY_SHOW_AFTER` in `crates/victory-gpu/src/descriptor/host.rs`, `texture.rs`, `texture/ahead.rs`).
-  - Expanded dynamic descriptor allocation on capped NVIDIA view heaps (`393,215` title slots and the remaining headroom for dynamic tables, configurable via `VICTORY_DYNAMIC_SLOTS` in `crates/victory-gpu/src/descriptor/host.rs`).
-  - Resolved default SRVs on typeless resources to concrete formats (`default_srv_for_desc`), expanded `SRGB` pairs to 7 formats (`R8G8B8A8`, `B8G8R8A8`, `B8G8R8X8`, `BC1`, `BC2`, `BC3`, `BC7`), backed sRGB-family filled, render-target, and UAV textures as typeless (`family`), and mapped typeless formats to concrete formats (`footprint_desc`) before `GetCopyableFootprints` calls (`crates/victory-gpu/src/resource.rs`, `texture.rs`, `texback.rs`, `capture.rs`).
+  - Enabled async ahead-of-draw texture uploads and non-blocking refreshes (`VICTORY_UPLOAD_AHEAD`, `VICTORY_TEXTURE_NO_WAIT`, `VICTORY_SHOW_AFTER` in `crates/victory-gpu/src/descriptor/host.rs`, `texture.rs`, `texture/ahead.rs`) while keeping `VICTORY_KEEP_SHOWN=1`.
+  - Preserved the full static title view range (`2^18` dynamic slots, ~737,855 title slots) on capped NVIDIA heaps while allowing explicit tuning via `VICTORY_DYNAMIC_SLOTS`, and scaled dynamic headroom on uncapped hosts (`crates/victory-gpu/src/descriptor/host.rs`).
+  - Resolved default SRVs and UAVs on typeless resources to concrete formats (`default_srv_for_desc`, `default_uav_for_desc`), expanded `SRGB` pairs to 7 formats (`R8G8B8A8`, `B8G8R8A8`, `B8G8R8X8`, `BC1`, `BC2`, `BC3`, `BC7`), backed sRGB-family filled textures and sRGB UAV textures as typeless (`family`), and mapped typeless formats to concrete formats (`footprint_desc`) before `GetCopyableFootprints` calls (`crates/victory-gpu/src/resource.rs`, `texture.rs`, `texback.rs`, `capture.rs`).
 
 ### 3. Black `NaN` Cutouts Inside Bright Highlights and Bloom
 - **Problem:** Console RDNA 2 shaders run with `DX10_CLAMP` semantics, flushing `NaN` results to `+0.0` on saturated operations. Lowering `clamp` to a bare DXIL `Saturate` intrinsic on NVIDIA GPUs allowed `NaN` pixels (from `0 * inf`, negative `rsq`/`log`, or divisions) to survive and spread across bloom mip downsamples, leaving sharp pitch-black holes inside bright doorways, specular highlights, and sky flares.
@@ -36,13 +36,13 @@ An optimized Windows Direct3D 12 compatibility runtime and RDNA 2-to-DXIL shader
 ### 5. Wave32 Water Rendering and Geometry Bounds
 - **Problem:** Console 64-lane water tile append shaders and water volume consumers split into two 32-lane waves on NVIDIA Wave32 GPUs, corrupting water tile indices and water lighting/color. Unbounded vertex buffer views and incomplete indexed `RECTANGLES` (`R10G10B10A2_UNORM`) attributes also caused stretched polygons.
 - **Fix:**
-  - Added the Wave32 water tile generator append rewrite (`crates/victory-shader/src/emit/water_tiles.rs`) and enforced logical 64-lane widening for water volume consumers (`crates/victory-shader/src/emit/mod.rs`).
+  - Added the Wave32 water tile generator append rewrite (`crates/victory-shader/src/emit/water_tiles.rs`) with opt-in `VICTORY_WAVE_WIDE=1` widening while avoiding forced loop-widening barriers (`crates/victory-shader/src/emit/mod.rs`).
   - Added contiguous vertex-buffer shadow validation (`resolve_geometry_shadow` in `crates/victory-gpu/src/draw.rs`) and `R10G10B10A2_UNORM` fourth-corner vertex attribute expansion (`crates/victory-gpu/src/primitive.rs`).
 
 ### 6. CPU Translation Overhead and System RAM Pressure
 - **Problem:** Single-threaded command translation, per-draw temporary heap allocations, redundant D3D12 copy/dispatch overhead, and large fixed DirectStorage staging buffers reduced frame pacing and strained 16 GB host systems.
 - **Fix:**
-  - Enabled ThinLTO (`lto = "thin"` in [Cargo.toml](Cargo.toml)), multi-threaded thin list translation (`list/thin.rs`), balanced descriptor compare worker counts (`land.rs`), joined command-list parts and indirect batching defaults (`host.rs`, `draw.rs`), single-pass staging (`host/send.rs`), thread-local scratch reuse (`draw.rs`, `host/place.rs`, `host/send.rs`, `dstorage.rs`), and RAM-scaled DirectStorage staging floors (`crates/victory-hle/src/modules/dstorage.rs`).
+  - Enabled ThinLTO (`lto = "thin"` in [Cargo.toml](Cargo.toml)), multi-threaded thin list translation (`list/thin.rs`), balanced descriptor compare worker counts (`land.rs`), joined command-list parts and indirect batching defaults (`host.rs`, `draw.rs`), layout-aligned staging (`host/send.rs`), thread-local scratch reuse (`draw.rs`, `host/place.rs`, `host/send.rs`, `dstorage.rs`), and RAM-scaled DirectStorage staging floors (`crates/victory-hle/src/modules/dstorage.rs`).
 
 ---
 

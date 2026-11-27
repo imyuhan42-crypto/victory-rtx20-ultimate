@@ -1500,26 +1500,16 @@ fn configured_dynamic_slots() -> Option<u32> {
 }
 
 /// Dynamic slots for a heap with `count` title slots and a null descriptor at
-/// `null`. When the capped host cannot hold the whole title heap plus the
-/// dynamic reserve, use more of its slots for dynamic tables. The tested
-/// retail heap's upper range is a ring of per-draw tables that already get
-/// copied into dynamic slots. Keep 393,215 title slots by default for the
-/// long-lived views below that ring (fxceless/victory-fork#1258).
-///
-/// `VICTORY_DYNAMIC_SLOTS` can select the capped split, with at least
-/// [`DYNAMIC`] dynamic slots and 65,536 title slots. On an uncapped host it
-/// still limits the existing allocation of spare slots.
+/// `null`. On capped heaps (`null < PORTABLE_VIEWS`, e.g. NVIDIA's 1,000,000),
+/// keep [`DYNAMIC`] (`2^18`, leaving ~737,855 title slots so long-lived views
+/// up to ~720,000 do not read null) unless `VICTORY_DYNAMIC_SLOTS` explicitly
+/// overrides it. On uncapped hosts, scale up to four times [`DYNAMIC`].
 fn dynamic_slots(count: u32, null: u32, configured: Option<u32>) -> u32 {
     let spare = null.saturating_sub(count);
     if null < PORTABLE_VIEWS {
-        if spare >= DYNAMIC {
-            return DYNAMIC;
-        }
-        const TITLE_SLOTS: u32 = 393_215;
         const MIN_TITLE_SLOTS: u32 = 1 << 16;
-        let default = null.saturating_sub(TITLE_SLOTS.min(count));
         let maximum = null.saturating_sub(MIN_TITLE_SLOTS).max(DYNAMIC);
-        return configured.unwrap_or(default).clamp(DYNAMIC, maximum);
+        return configured.unwrap_or(DYNAMIC).clamp(DYNAMIC, maximum);
     }
     spare.min(configured.unwrap_or(DYNAMIC << 2)).max(DYNAMIC)
 }
@@ -4344,7 +4334,23 @@ fn make_twinned(
                     desc = Some(view);
                     twin
                 }
-                None => texture,
+                None => {
+                    if desc.as_ref().is_none_or(|d| d.Format.0 == 0)
+                        && let Some(format) = crate::resource::view_format(resource)
+                    {
+                        match &mut desc {
+                            Some(d) => {
+                                d.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32);
+                            }
+                            None => {
+                                // SAFETY: a live resource.
+                                let own = unsafe { texture.GetDesc() };
+                                desc = Some(default_uav_for_desc(&own, format));
+                            }
+                        }
+                    }
+                    texture
+                }
             };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
@@ -4589,10 +4595,61 @@ fn default_srv_for_desc(
     out
 }
 
+fn default_uav_for_desc(
+    own: &D3D12_RESOURCE_DESC,
+    format: u32,
+) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    let arrays = u32::from(own.DepthOrArraySize.max(1));
+    let mut out = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    match own.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if arrays > 1 => {
+            out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+            out.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                MipSlice: 0,
+                FirstArraySlice: 0,
+                ArraySize: arrays,
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+            out.Anonymous.Texture1D = D3D12_TEX1D_UAV { MipSlice: 0 };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            out.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                MipSlice: 0,
+                FirstWSlice: 0,
+                WSize: u32::MAX,
+            };
+        }
+        _ if arrays > 1 => {
+            out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            out.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                MipSlice: 0,
+                FirstArraySlice: 0,
+                ArraySize: arrays,
+                PlaneSlice: 0,
+            };
+        }
+        _ => {
+            out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            out.Anonymous.Texture2D = D3D12_TEX2D_UAV {
+                MipSlice: 0,
+                PlaneSlice: 0,
+            };
+        }
+    }
+    out
+}
+
 /// Whether a slot that is written with a view of another texture goes on
 /// showing the one it shows until the new one is made and its upload has run
-/// (`VICTORY_KEEP_SHOWN`): 0 (default): never, it reads as zeros, then as the neutral
-/// texture; 1: one of the same kind in another place or size; 2: any of the
+/// (`VICTORY_KEEP_SHOWN`): 0: never, it reads as zeros, then as the neutral
+/// texture; 1 (default): one of the same kind in another place or size; 2: any of the
 /// same dimension.
 fn keep_shown() -> u8 {
     #[cfg(feature = "diagnostics")]
@@ -4600,7 +4657,7 @@ fn keep_shown() -> u8 {
         return if on { 2 } else { 0 };
     }
     static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
 }
 
 /// Slots that showed a texture and were written with a view of another,
@@ -5019,17 +5076,17 @@ mod tests {
     }
 
     #[test]
-    fn unready_slot_does_not_keep_moved_or_sized_texture_by_default() {
-        assert_eq!(keep_shown(), 0);
-        assert!(Kin::Same.kept(0));
-        assert!(!Kin::Moved.kept(0));
-        assert!(!Kin::Sized.kept(0));
-        assert!(!Kin::Other.kept(0));
-        assert!(!Kin::None.kept(0));
+    fn unready_slot_keeps_moved_and_sized_texture_by_default() {
+        assert_eq!(keep_shown(), 1);
+        assert!(Kin::Same.kept(1));
+        assert!(Kin::Moved.kept(1));
+        assert!(Kin::Sized.kept(1));
+        assert!(!Kin::Other.kept(1));
+        assert!(!Kin::None.kept(1));
     }
 
     #[test]
-    fn default_srv_for_typeless_resource_uses_concrete_format() {
+    fn default_srv_and_uav_for_typeless_resource_use_concrete_format() {
         let mut own = D3D12_RESOURCE_DESC::default();
         own.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         own.Width = 256;
@@ -5044,6 +5101,11 @@ mod tests {
         // SAFETY: Texture2D matches ViewDimension.
         let t2d = unsafe { srv.Anonymous.Texture2D };
         assert_eq!(t2d.MipLevels, 4);
+
+        own.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(27); // R8G8B8A8_TYPELESS
+        let uav = default_uav_for_desc(&own, 28);
+        assert_eq!(uav.Format.0, 28);
+        assert_eq!(uav.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2D);
     }
 
     /// Memory past the levels a slot's view shows is not its texture's.
@@ -5809,11 +5871,10 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_slots_rebalance_only_an_overflowing_capped_heap() {
+    fn dynamic_slots_preserve_title_range_on_capped_heap() {
         let capped_null = PORTABLE_VIEWS - 1;
         let retail_count = 1_245_184;
-        assert_eq!(dynamic_slots(retail_count, capped_null, None), 606_784);
-        assert_eq!(dynamic_slots(retail_count, capped_null, Some(DYNAMIC)), DYNAMIC);
+        assert_eq!(dynamic_slots(retail_count, capped_null, None), DYNAMIC);
         assert_eq!(dynamic_slots(retail_count, capped_null, Some(500_000)), 500_000);
         assert_eq!(dynamic_slots(retail_count, capped_null, Some(10)), DYNAMIC);
         assert_eq!(

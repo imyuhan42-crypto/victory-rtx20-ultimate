@@ -475,14 +475,6 @@ fn emit_ready(
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
-        // Both transmission consumers need one logical 64-lane wave per
-        // group. Half-wave results cannot replace their tile-wide results.
-        let water_volume = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
-            && matches!(
-                c.digest,
-                [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
-                    | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
-            );
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -501,7 +493,7 @@ fn emit_ready(
         // the same way last of all, each half-wave giving its own results
         // (approximate: a tile-wide result becomes two half-tile ones);
         // `VICTORY_WAVE_LOCAL=idiom` refuses those instead.
-        let strict = water_volume || std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
         let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {
@@ -576,7 +568,7 @@ fn emit_ready(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel || water_volume, |v| v == "1");
+        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
