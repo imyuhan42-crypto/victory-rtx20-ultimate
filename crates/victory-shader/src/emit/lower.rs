@@ -3713,6 +3713,16 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Clamps `f` to `[0.0, 1.0]` with `DX10_CLAMP` semantics (`NaN` -> `+0.0`).
+    /// Tests NaN in integer arithmetic via `is_nan_f32` so NVIDIA drivers under
+    /// fast-math cannot fold away NaN handling or turn `saturate(NaN)` into `1.0`.
+    fn saturate(&mut self, f: V) -> V {
+        let clamped = self.unary(7, f);
+        let nan = self.is_nan_f32(f);
+        let zero = self.s.m.f32(0.0f32.to_bits());
+        self.s.m.select(self.cur, nan, zero, clamped)
+    }
+
     fn binary(&mut self, op: u32, a: V, b: V) -> V {
         self.s.op(
             self.cur,
@@ -4488,7 +4498,7 @@ impl<'a> Lower<'a> {
             }
         }
         if v.clamp {
-            f = self.unary(7, f);
+            f = self.saturate(f);
         }
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a float result outside a VGPR");
@@ -8537,7 +8547,7 @@ impl<'a> Lower<'a> {
                     return float(self, r);
                 }
                 if v.clamp {
-                    r = self.unary(7, r);
+                    r = self.saturate(r);
                 }
                 // The f16 result goes to one half; the other half stays.
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
@@ -8563,13 +8573,30 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_cvt_pkrtz_f16_f32" => {
-                let (a, bb) = (f(self, 0)?, f(self, 1)?);
+                let (mut a, mut bb) = (f(self, 0)?, f(self, 1)?);
+                if v.omod != 0 {
+                    let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+                    let k = self.s.m.f32(factor.to_bits());
+                    a = self.s.m.bin(c, Bin::Mul, a, k);
+                    bb = self.s.m.bin(c, Bin::Mul, bb, k);
+                }
+                if v.clamp {
+                    a = self.saturate(a);
+                    bb = self.saturate(bb);
+                }
                 let lo = self.f16_toward_zero(a);
                 let hi = self.f16_toward_zero(bb);
                 let sh = self.s.m.i32(16);
                 let hi = self.s.m.bin(c, Bin::Shl, hi, sh);
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
-                int(self, r)
+                // Output modifiers (`omod`/`clamp`) were already applied to each
+                // float lane above, so write directly without `write_i` rejecting them.
+                if let Some(Operand::Vector { reg, .. }) = v.dst {
+                    self.write(inst, Reg::V(reg), r, guard);
+                    Ok(())
+                } else {
+                    Err("a result without a register")
+                }
             }
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded to nearest even (the MODE default) into the low half.
@@ -9377,7 +9404,7 @@ impl<'a> Lower<'a> {
                 }
             }
             if v.clamp {
-                f = l.unary(7, f);
+                f = l.saturate(f);
             }
             // The console rounds to nearest; the host's conversion may round toward zero
             // (NVIDIA's does), one step of the last place lower where the two differ.
@@ -9743,7 +9770,7 @@ impl<'a> Lower<'a> {
                     _ => self.fmad(xs[0], xs[1], xs[2]),
                 };
                 if v.clamp {
-                    f = self.unary(7, f);
+                    f = self.saturate(f);
                 }
                 self.s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
@@ -10613,7 +10640,7 @@ impl<'a> Lower<'a> {
                             f = self.s.m.bin(c, Bin::Mul, f, k);
                         }
                         if clamp {
-                            f = self.unary(7, f);
+                            f = self.saturate(f);
                         }
                         let lo = to_f16(self, f);
                         return self.write_half(inst, lo, None);

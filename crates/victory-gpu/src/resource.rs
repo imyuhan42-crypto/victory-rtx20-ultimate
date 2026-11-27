@@ -625,7 +625,51 @@ pub(crate) fn family(format: u32) -> u32 {
 }
 
 /// sRGB formats and their linear twins.
-pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
+pub(crate) const SRGB: [(u32, u32); 7] = [
+    (29, 28), // R8G8B8A8_UNORM_SRGB / UNORM
+    (72, 71), // BC1_UNORM_SRGB / UNORM
+    (75, 74), // BC2_UNORM_SRGB / UNORM
+    (78, 77), // BC3_UNORM_SRGB / UNORM
+    (91, 87), // B8G8R8A8_UNORM_SRGB / UNORM
+    (93, 88), // B8G8R8X8_UNORM_SRGB / UNORM
+    (99, 98), // BC7_UNORM_SRGB / UNORM
+];
+
+/// Concrete colour/block format for typeless DXGI formats (for copyable footprint queries).
+pub(crate) fn concrete_format(format: u32) -> u32 {
+    match format {
+        1 => 2,   // R32G32B32A32
+        5 => 6,   // R32G32B32
+        9 => 10,  // R16G16B16A16
+        15 => 16, // R32G32
+        23 => 24, // R10G10B10A2
+        27 => 28, // R8G8B8A8
+        33 => 34, // R16G16
+        48 => 49, // R8G8
+        70 => 71, // BC1
+        73 => 74, // BC2
+        76 => 77, // BC3
+        79 => 80, // BC4
+        82 => 83, // BC5
+        90 => 87, // B8G8R8A8
+        92 => 88, // B8G8R8X8
+        94 => 95, // BC6H
+        97 => 98, // BC7
+        other => other,
+    }
+}
+
+/// Replaces a typeless colour/block format on `desc` with its concrete format
+/// before calling `GetCopyableFootprints`.
+#[cfg(windows)]
+pub(crate) fn footprint_desc(
+    mut desc: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+) -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC {
+    desc.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
+        concrete_format(desc.Format.0 as u32) as i32,
+    );
+    desc
+}
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
@@ -1517,6 +1561,31 @@ pub(crate) fn host_waits(this: This) -> bool {
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
 }
 
+#[cfg(windows)]
+static PENDING_TEXTURE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+struct PendingTextureGuard(u64);
+
+#[cfg(windows)]
+impl PendingTextureGuard {
+    fn enter(bytes: u64) -> Self {
+        if bytes > 0 {
+            PENDING_TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+        Self(bytes)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PendingTextureGuard {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            PENDING_TEXTURE_BYTES.fetch_sub(self.0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// The host side of title texture `this`: made now if it is not there and
 /// `make` says so. `None` for buffers and for textures the host refuses.
 #[cfg(windows)]
@@ -1531,6 +1600,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if !make || r.host.refused.load(Relaxed) {
             return None;
         }
+        let pending_bytes = if fills(&r.desc) { footprint(&r.desc).map_or(0, |f| f.size) } else { 0 };
+        let pending = PendingTextureGuard::enter(pending_bytes);
         let clear = r
             .host
             .clear
@@ -1618,6 +1689,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             HELD[3].fetch_add(footprint(&r.desc).map_or(0, |f| f.size), Relaxed);
         }
         host.filled = fills(&r.desc);
+        drop(pending);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
             KINDS[1].fetch_add(host.bytes, Relaxed);
@@ -1654,14 +1726,20 @@ pub(crate) fn host_made<'a>(
 }
 
 /// Unconditional host-texture floor for a given local VRAM budget (`None` when
-/// the adapter does not report one): up to 2 GiB, capped at a quarter of the
-/// reported budget so 4–6 GiB cards do not bypass the budget check early.
+/// the adapter does not report one): kept tight on 6–8 GB cards so bindless
+/// texture streaming enforces the real VRAM budget early.
 #[cfg(any(windows, test))]
 fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
     const MAX_FLOOR: u64 = 2 << 30;
     match vram_budget {
-        Some(budget) => MAX_FLOOR.min(budget / 4),
         None => MAX_FLOOR,
+        Some(0) => 256 * MIB,
+        Some(budget) if budget <= 6 * GIB + 512 * MIB => 256 * MIB,
+        Some(budget) if budget <= 9 * GIB => 512 * MIB,
+        Some(budget) if budget <= 12 * GIB => 1024 * MIB,
+        Some(_) => MAX_FLOOR,
     }
 }
 
@@ -1683,7 +1761,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     });
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
-    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total() + PENDING_TEXTURE_BYTES.load(Relaxed);
     if let Some(limit) = limit {
         return filled < limit;
     }
@@ -1696,18 +1774,34 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+        Some([budget, used, ..]) if budget > 0 => {
+            used.saturating_sub(crate::pool::texture_room())
+                + PENDING_TEXTURE_BYTES.load(Relaxed)
+                + crate::shadow::card_room_kept()
+                + targets_room_kept()
                 < budget / 100 * room_percent()
         }
-        None => filled < WITHOUT_BUDGET,
+        _ => filled < WITHOUT_BUDGET,
     }
+}
+
+#[cfg(any(windows, test))]
+fn targets_room_kept_for(vram_budget: Option<u64>, targets: u64, env_override_mb: Option<u64>) -> u64 {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    let default_mb = match vram_budget {
+        Some(budget) if budget > 0 && budget <= 6 * GIB + 512 * MIB => 1280,
+        Some(budget) if budget > 0 && budget <= 9 * GIB => 2048,
+        _ => 3072,
+    };
+    let most = env_override_mb.unwrap_or(default_mb).min(8192) << 20;
+    most.saturating_sub(targets)
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (1280 on 6 GB cards,
+/// 2048 on 8 GB, 3072 on >=10 GB; 0: none) less what such copies hold now.
 ///
 /// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
 /// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
@@ -1724,16 +1818,16 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static OVERRIDE_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let override_mb = *OVERRIDE_MB.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
+    let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b);
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    targets_room_kept_for(budget, targets, override_mb)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2458,19 +2552,22 @@ fn host_texture_as(
     {
         d.format = typeless;
     }
-    // The host has no sRGB unordered access: such textures are typeless,
-    // their unordered access views plain UNORM.
-    if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
+    // The host has no sRGB unordered access and requires typeless backing for
+    // sRGB <-> linear view casting on filled, render-target, and UAV textures
+    // (including BC1/2/3/7 and RGBA8/BGRA8 targets).
+    if (fills(desc) || d.flags & (TARGET | UNORDERED) != 0)
+        && SRGB.iter().any(|&(srgb, linear)| srgb == d.format || linear == d.format)
+    {
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
+    // and stencil (5 words), which must remain concrete on typeless textures.
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        value[0] = concrete_format(pc_format(value[0]));
         if d.flags & (TARGET | UNORDERED) != 0 {
-            value[0] = target_format(value[0]);
+            value[0] = concrete_format(target_format(value[0]));
         }
         value
     });
@@ -4536,13 +4633,20 @@ float4 lit() : SV_Target { return 1.0; }
     #[test]
     fn texture_floor_scales_with_vram_budget() {
         const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
         assert_eq!(texture_floor_bytes(None), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(4 * GIB)), GIB);
-        assert_eq!(texture_floor_bytes(Some(6 * GIB)), 6 * GIB / 4);
-        assert_eq!(texture_floor_bytes(Some(8 * GIB)), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(0)), 256 * MIB);
+        assert_eq!(texture_floor_bytes(Some(4 * GIB)), 256 * MIB);
+        assert_eq!(texture_floor_bytes(Some(6 * GIB)), 256 * MIB);
+        assert_eq!(texture_floor_bytes(Some(8 * GIB)), 512 * MIB);
+        assert_eq!(texture_floor_bytes(Some(12 * GIB)), 1024 * MIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+
+        assert_eq!(targets_room_kept_for(Some(6 * GIB), 256 * MIB, None), 1024 * MIB);
+        assert_eq!(targets_room_kept_for(Some(8 * GIB), 512 * MIB, None), 1536 * MIB);
+        assert_eq!(targets_room_kept_for(Some(12 * GIB), 0, None), 3072 * MIB);
+        assert_eq!(targets_room_kept_for(Some(6 * GIB), 0, Some(2048)), 2048 * MIB);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

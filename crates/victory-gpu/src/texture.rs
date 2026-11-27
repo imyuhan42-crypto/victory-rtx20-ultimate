@@ -212,11 +212,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 let mut rows = [(); 2]
                     .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
                 let mut bytes = [0u64; 2];
+                let (from_fp, to_fp) = (
+                    crate::resource::footprint_desc(of_from),
+                    crate::resource::footprint_desc(of_to),
+                );
                 // SAFETY: plain queries; the out pointers are ours and
                 // hold `parts` layouts each.
                 unsafe {
                     host.device.GetCopyableFootprints(
-                        &of_from,
+                        &from_fp,
                         0,
                         parts,
                         0,
@@ -226,7 +230,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                         Some(&mut bytes[0]),
                     );
                     host.device.GetCopyableFootprints(
-                        &of_to,
+                        &to_fp,
                         0,
                         parts,
                         0,
@@ -373,7 +377,16 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// has recorded the upload from it by then.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        #[cfg(test)]
+        {
+            std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1")
+        }
+        #[cfg(not(test))]
+        {
+            std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0")
+        }
+    })
 }
 
 /// Whether a refresh that does not wait ([`no_wait`]) and finds a page
@@ -1022,10 +1035,11 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
     let count = u32::from(d.MipLevels) * layers;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut bytes = 0u64;
+    let fp_desc = crate::resource::footprint_desc(d);
     // SAFETY: outputs for `count` subresources.
     unsafe {
         host.device
-            .GetCopyableFootprints(&d, 0, count, 0, Some(footprints.as_mut_ptr()), None, None, Some(&mut bytes));
+            .GetCopyableFootprints(&fp_desc, 0, count, 0, Some(footprints.as_mut_ptr()), None, None, Some(&mut bytes));
     }
     if bytes == 0 || bytes == u64::MAX {
         return;
@@ -1088,13 +1102,14 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
         crate::list::ensure_state(list, resource, COPY_DEST);
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
+        let fp_desc = crate::resource::footprint_desc(d);
         for level in (0..u32::from(d.MipLevels).min(32)).filter(|&level| fresh & (1u32 << level) != 0) {
             let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
             let mut bytes = 0u64;
             // SAFETY: outputs for one subresource.
             unsafe {
                 host.device
-                    .GetCopyableFootprints(&d, level, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
+                    .GetCopyableFootprints(&fp_desc, level, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
             }
             let Some((buffer, data)) = list.upload(host, bytes) else {
                 // (With the levels that share its tiles, if it is one of
@@ -1874,10 +1889,11 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
+    let fp_desc = crate::resource::footprint_desc(d);
     // SAFETY: outputs for `count` subresources.
     unsafe {
         host.device.GetCopyableFootprints(
-            &d,
+            &fp_desc,
             first - level0,
             count,
             0,

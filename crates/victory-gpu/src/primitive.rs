@@ -40,6 +40,12 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
         fourth.copy_from_slice(v(0));
         for &(offset, format) in elements {
             let at = offset as usize;
+            if format == 24 {
+                if at + 4 <= stride {
+                    expand_unorm10_10_10_2(v(0), v(1), v(2), fourth, at);
+                }
+                continue;
+            }
             let Some((n, kind)) = components(format) else {
                 continue;
             };
@@ -53,6 +59,24 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
             }
         }
     }
+}
+
+/// Interpolates packed `R10G10B10A2_UNORM` (DXGI format 24) fourth rectangle corner.
+fn expand_unorm10_10_10_2(v0: &[u8], v1: &[u8], v2: &[u8], fourth: &mut [u8], at: usize) {
+    let word = |v: &[u8]| u32::from_le_bytes([v[at], v[at + 1], v[at + 2], v[at + 3]]);
+    let (w0, w1, w2) = (word(v0), word(v1), word(v2));
+    let rgb = |shift: u32| {
+        let c = |w: u32| f32::from(((w >> shift) & 0x3ff) as u16) / 1023.0;
+        let v = (c(w0) + c(w2) - c(w1)).clamp(0.0, 1.0);
+        ((v * 1023.0).round() as u32) << shift
+    };
+    let a = {
+        let c = |w: u32| f32::from(((w >> 30) & 0x3) as u8) / 3.0;
+        let v = (c(w0) + c(w2) - c(w1)).clamp(0.0, 1.0);
+        ((v * 3.0).round() as u32) << 30
+    };
+    let packed = rgb(0) | rgb(10) | rgb(20) | a;
+    fourth[at..at + 4].copy_from_slice(&packed.to_le_bytes());
 }
 
 #[derive(Clone, Copy)]
@@ -362,5 +386,16 @@ mod tests {
             &dst[11 * 16..12 * 16],
             &v([14.0, 20.0, 1.0], [0.75, 0.5])[..]
         );
+    }
+
+    #[test]
+    fn r10g10b10a2_unorm_fourth_corner_expands() {
+        let pack = |r: u32, g: u32, b: u32, a: u32| -> [u8; 4] {
+            (r | (g << 10) | (b << 20) | (a << 30)).to_le_bytes()
+        };
+        let src = [pack(100, 500, 900, 3), pack(200, 200, 300, 1), pack(400, 600, 400, 2)].concat();
+        let mut dst = [0u8; 6 * 4];
+        expand_rects(&src, &mut dst, 4, &[(0, 24)]);
+        assert_eq!(&dst[20..24], &pack(300, 900, 1000, 3));
     }
 }

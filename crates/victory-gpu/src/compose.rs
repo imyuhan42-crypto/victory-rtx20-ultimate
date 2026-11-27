@@ -1,4 +1,4 @@
-﻿//! Two presented planes as one image: the console's display puts the second
+//! Two presented planes as one image: the console's display puts the second
 //! (the interface) over the first (the scene), each scaled to the screen.
 //! Grand Theft Auto VI presents so on Series S.
 
@@ -190,8 +190,9 @@ impl Composer {
     }
 }
 
-/// Select a legal float-sampled view of a display plane, preserving a typed
-/// resource's format. Typeless resources use the corresponding display type.
+/// Select a legal float-sampled view of a display plane, preserving non-sRGB
+/// precision while keeping sRGB planes un-decoded when writing into a
+/// non-sRGB swap chain (`UNORM`, matching single-plane presentation).
 pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
     if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
         || d.DepthOrArraySize != 1
@@ -203,10 +204,35 @@ pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
     match d.Format.0 {
         9 => Some(DXGI_FORMAT_R16G16B16A16_FLOAT),
         23 => Some(DXGI_FORMAT_R10G10B10A2_UNORM),
-        27 => Some(DXGI_FORMAT_R8G8B8A8_UNORM),
-        90 => Some(DXGI_FORMAT_B8G8R8A8_UNORM),
-        10 | 11 | 13 | 24 | 26 | 28 | 29 | 31 | 67 | 87 | 91 => Some(d.Format),
+        27 | 29 => Some(DXGI_FORMAT_R8G8B8A8_UNORM),
+        90 | 91 => Some(DXGI_FORMAT_B8G8R8A8_UNORM),
+        10 | 11 | 13 | 24 | 26 | 28 | 31 | 67 | 87 => Some(d.Format),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn compose_view_keeps_hdr_10bit_and_avoids_srgb_double_darken() {
+        let mut desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            DepthOrArraySize: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        desc.Format = DXGI_FORMAT_R10G10B10A2_TYPELESS;
+        assert_eq!(view(&desc), Some(DXGI_FORMAT_R10G10B10A2_UNORM));
+        desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+        assert_eq!(view(&desc), Some(DXGI_FORMAT_R10G10B10A2_UNORM));
+        desc.Format = DXGI_FORMAT_R16G16B16A16_TYPELESS;
+        assert_eq!(view(&desc), Some(DXGI_FORMAT_R16G16B16A16_FLOAT));
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        assert_eq!(view(&desc), Some(DXGI_FORMAT_R8G8B8A8_UNORM));
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        assert_eq!(view(&desc), Some(DXGI_FORMAT_B8G8R8A8_UNORM));
     }
 }
 

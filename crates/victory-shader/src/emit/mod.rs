@@ -429,8 +429,28 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+mod water_tiles;
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    if let Some(native) = water_tiles::rewrite(c, native)? {
+        let program = crate::spill::build(&native)?;
+        let structured = structure::structure(&program)?;
+        let resources = resource::track(&program, &native.layout, native.stage, Some(&structured))?;
+        let inputs = io::raise(&program, &native)?;
+        return emit_ready(c, &native, &program, &structured, &inputs, &resources);
+    }
+    emit_ready(c, native, p, st, io, res)
+}
+
+fn emit_ready(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -455,6 +475,14 @@ pub fn emit(
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+        // Both transmission consumers need one logical 64-lane wave per
+        // group. Half-wave results cannot replace their tile-wide results.
+        let water_volume = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+            && matches!(
+                c.digest,
+                [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
+                    | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+            );
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -473,7 +501,7 @@ pub fn emit(
         // the same way last of all, each half-wave giving its own results
         // (approximate: a tile-wide result becomes two half-tile ones);
         // `VICTORY_WAVE_LOCAL=idiom` refuses those instead.
-        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+        let strict = water_volume || std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
         let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {
@@ -548,7 +576,7 @@ pub fn emit(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        let wide_on = wide_option.as_ref().map_or(scene_kernel || water_volume, |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -1065,7 +1093,12 @@ mod tests {
         if !dxc.exists() {
             return None;
         }
-        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file = std::env::temp_dir().join(format!(
+            "victory-interp-{}-{id}.dxil",
+            std::process::id()
+        ));
         std::fs::write(&file, container).ok()?;
         let out = std::process::Command::new(dxc)
             .arg("-dumpbin")
@@ -1173,6 +1206,83 @@ mod tests {
             "clamp saturates the result"
         );
         assert!(!low.contains("dx.op.unary.f32(i32 7"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saturate_clamp_emits_integer_nan_flush_matching_dx10_clamp() {
+        // v_add_f32 v0, v1, v2 clamp  (VOP3 opcode 0x103, clamp bit = 1<<15)
+        // v_cvt_pkrtz_f16_f32 v0, v0, v1 clamp (VOP3 opcode 0x12f, clamp bit = 1<<15)
+        // exp mrt0, v0, v0, v0, v0 done vm
+        // s_endpgm
+        let vop3_clamp = |op: u32, vdst: u32, src0: u32, src1: u32| -> [u32; 2] {
+            [
+                0xD400_0000 | (op << 16) | (1 << 15) | vdst,
+                (src0 & 0x1FF) | ((src1 & 0x1FF) << 9),
+            ]
+        };
+        let add = vop3_clamp(0x103, 0, 257, 258);
+        let pkrtz = vop3_clamp(0x12f, 0, 256, 257);
+        let words = [
+            add[0],
+            add[1],
+            pkrtz[0],
+            pkrtz[1],
+            0xF800_180Fu32,
+            0x0000_0000,
+            0xBF81_0000,
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let osg1 = super::container::signature(&[el], false);
+        let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        if let Ok(mut v) = super::validator::Validator::default_path()
+            .ok_or(())
+            .and_then(|p| super::validator::Validator::load(Some(&p)).map_err(|_| ()))
+        {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        if let Some(dxil_text) = dump_dxil(&out.dxil) {
+            assert!(dxil_text.contains("dx.op.unary.f32(i32 7"), "missing Saturate op");
+            assert!(
+                dxil_text.contains("2147483647") && dxil_text.contains("2139095040"),
+                "missing integer DX10_CLAMP NaN test masks in DXIL:\n{dxil_text}"
+            );
+            assert!(
+                dxil_text.contains("select i1"),
+                "missing select flushing NaN to 0.0 in DXIL"
+            );
+        }
     }
 
     #[test]

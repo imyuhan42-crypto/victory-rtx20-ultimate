@@ -52,20 +52,48 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
+        let limited = crate::residency::limited_host_ram();
         let staging_limit = if crate::residency::critical_commit() {
             0
         } else if pressure {
             1
         } else {
-            limit
+            limit.min(if limited { 2 } else { STAGING_KEPT })
         };
         pool.reclaim(tick, staging_limit, true);
     }
 }
 
+fn max_spare_kept(vram_budget: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    match vram_budget {
+        Some(b) if b > 0 && b <= 6 * GIB + 512 * MIB => 2,
+        Some(b) if b > 0 && b <= 9 * GIB => 4,
+        Some(b) if b > 0 && b <= 12 * GIB => 8,
+        Some(b) if b > 0 && b <= 16 * GIB => 16,
+        _ => SPARE_KEPT,
+    }
+}
+
+fn default_ahead_blocks(vram_budget: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    match vram_budget {
+        Some(b) if b > 0 && b <= 6 * GIB + 512 * MIB => 2,
+        Some(b) if b > 0 && b <= 9 * GIB => 4,
+        Some(b) if b > 0 && b <= 12 * GIB => 6,
+        _ => 12,
+    }
+}
+
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..])
+            if budget > 0 && keep && u128::from(used) * 100 < u128::from(budget) * 85 =>
+        {
+            max_spare_kept(Some(budget))
+        }
         _ => SPARE,
     }
 }
@@ -74,6 +102,7 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
 /// frames, a tenth of a second while the title shows a loading screen at 30
 /// a second, with up to 18 submissions in the air.)
 const REST: u64 = 2500;
+const STAGING_REST: u64 = 250;
 
 fn now() -> u64 {
     crate::host::now_ms()
@@ -85,20 +114,19 @@ pub(crate) fn on() -> bool {
 }
 
 /// How many blocks of textures are made ahead, so that one has been there
-/// for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, 12;
-/// 0: none, and new blocks are used at once, as before).
-///
-/// A page fault of lists already on the card, in a texture made the same
-/// tenth of a second as the first piece of a block made for it, lost the
-/// device in runs n08 and n11 (2026-11-25): the title gives a slot that
-/// those lists read by index a new texture. Why the card does not have the
-/// new block's addresses yet is not known (n11 waited for `MakeResident`;
-/// `indirect::tests::new_blocks_under_readers` never loses it). A block that
-/// every submission begun before its making has left behind ([`Ripe`]) has
-/// no such lists: pieces are cut from those first.
+/// for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, scaled
+/// to 2 on 6 GB, 4 on 8 GB, 6 on 12 GB, 12 on 16+ GB; `0` disables).
 fn ahead() -> usize {
     static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+    *AHEAD.get_or_init(|| {
+        std::env::var("VICTORY_RIPE_BLOCKS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| {
+                let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b);
+                default_ahead_blocks(budget)
+            })
+    })
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how
@@ -299,7 +327,11 @@ impl<B: Clone> Pool<B> {
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
-        self.resting.push_back((now + REST, piece));
+        self.give_after(piece, now, REST);
+    }
+
+    fn give_after(&mut self, piece: Piece, now: u64, rest_ms: u64) {
+        self.resting.push_back((now + rest_ms, piece));
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
@@ -373,7 +405,8 @@ pub(crate) struct StagingPiece(Piece);
 
 impl Drop for StagingPiece {
     fn drop(&mut self) {
-        lock(&STAGING).give(self.0, now());
+        let rest = if crate::residency::pressured() { 0 } else { STAGING_REST };
+        lock(&STAGING).give_after(self.0, now(), rest);
     }
 }
 
@@ -584,6 +617,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spares_and_ahead_scale_down_on_6gb_and_8gb_gpus() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(max_spare_kept(Some(6 * GIB)), 2);
+        assert_eq!(max_spare_kept(Some(8 * GIB)), 4);
+        assert_eq!(max_spare_kept(Some(12 * GIB)), 8);
+        assert_eq!(default_ahead_blocks(Some(6 * GIB)), 2);
+        assert_eq!(default_ahead_blocks(Some(8 * GIB)), 4);
+        assert_eq!(spares(Some([6 * GIB, 2 * GIB, 0, 0]), true), 2);
+        assert_eq!(spares(Some([0, 0, 0, 0]), true), SPARE);
+    }
+
+    #[test]
     fn ranges_are_cut_aligned_and_join_again() {
         let mut r = Ranges::new(1024);
         assert_eq!(r.take(100, 64), Some(0));
@@ -599,9 +644,10 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        const BIG: u64 = 20 << 30;
+        assert_eq!(spares(Some([BIG, BIG * 84 / 100, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([BIG, BIG * 85 / 100, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([BIG, BIG / 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
     }
 

@@ -28,6 +28,9 @@
 //! - a number: that share of the estimate (1: all of it).
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
+//! `VICTORY_AMBIENT_FILTER_MAGENTA=1` tests filtering strongly magenta probe
+//! history before combining it with the estimate.
+//!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
@@ -321,6 +324,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+#ifdef FILTER_MAGENTA
+    // Reject strongly magenta probe history (Belobug e942896).
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+#endif
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
@@ -373,7 +380,12 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let mean = pipeline("KEEP", s!("mean"))?;
     let place = pipeline("PLACE", s!("place"))?;
     let gather = pipeline("GATHER", s!("gather"))?;
-    let raise = pipeline("RAISE", s!("raise"))?;
+    let filter_magenta = std::env::var_os("VICTORY_AMBIENT_FILTER_MAGENTA").is_some_and(|v| v == "1");
+    let raise_defines = if filter_magenta { "RAISE\n#define FILTER_MAGENTA" } else { "RAISE" };
+    let raise = pipeline(raise_defines, s!("raise"))?;
+    if filter_magenta {
+        tracing::info!("filtering strongly magenta indirect probe history");
+    }
     let air = pipeline("AIR", s!("clear_air"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {

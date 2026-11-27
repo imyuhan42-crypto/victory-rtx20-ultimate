@@ -255,7 +255,7 @@ fn read_back_of(
     let mut total = 0;
     // SAFETY: a live texture; outputs for one subresource.
     unsafe {
-        let desc = texture.GetDesc();
+        let desc = crate::resource::footprint_desc(texture.GetDesc());
         device.GetCopyableFootprints(
             &desc,
             sub,

@@ -443,6 +443,7 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
+        send::trim_spare();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -2144,7 +2145,16 @@ unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::Card
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        #[cfg(test)]
+        {
+            std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1")
+        }
+        #[cfg(not(test))]
+        {
+            std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0")
+        }
+    })
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -2153,17 +2163,20 @@ fn rehash_runs() -> bool {
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
-/// default). The pieces the card's compare found differing come down in
-/// one fetch and were then merged one after the other on the thread that
-/// settles: about 630 pieces and 40 MB a frame (run 104), each compared
-/// with the copy's CPU side byte by byte and put into title memory through
-/// the kernel. A piece is its own bytes of its copy and of title memory,
-/// so eight threads take an eighth of them each. (Not with [`relay`], whose
-/// landings do not come here: `crate::land` has threads of its own.)
+/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; on by
+/// default outside tests, `=0` disables).
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        #[cfg(test)]
+        {
+            std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1")
+        }
+        #[cfg(not(test))]
+        {
+            std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0")
+        }
+    })
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -2502,7 +2515,16 @@ fn relay_exact() -> bool {
 /// may be in what is fetched, as before.
 fn relay_copy() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        #[cfg(test)]
+        {
+            std::env::var_os("VICTORY_RELAY_COPY").is_some_and(|v| v == "1")
+        }
+        #[cfg(not(test))]
+        {
+            std::env::var_os("VICTORY_RELAY_COPY").is_none_or(|v| v != "0")
+        }
+    })
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -3092,7 +3114,13 @@ pub(crate) fn joins() -> (usize, usize) {
 fn joins_asked() -> (usize, usize) {
     static MOST: OnceLock<(usize, usize)> = OnceLock::new();
     let of = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
-    let (parts, lists) = *MOST.get_or_init(|| (of("VICTORY_JOIN_PARTS").unwrap_or(1).max(1), of("VICTORY_JOIN_LISTS").unwrap_or(48).max(1)));
+    #[cfg(test)]
+    let default_parts = 1usize;
+    #[cfg(not(test))]
+    let default_parts = 8usize;
+    let (parts, lists) = *MOST.get_or_init(|| {
+        (of("VICTORY_JOIN_PARTS").unwrap_or(default_parts).max(1), of("VICTORY_JOIN_LISTS").unwrap_or(48).max(1))
+    });
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_JOIN_PARTS") {
         return (if on { 8 } else { 1 }, lists);
@@ -3770,7 +3798,16 @@ mod late_tests {
 /// only the copy that held it did.
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        #[cfg(test)]
+        {
+            std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1")
+        }
+        #[cfg(not(test))]
+        {
+            std::env::var_os("VICTORY_JOIN_COPIES").is_none_or(|v| v != "0")
+        }
+    })
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
@@ -9002,14 +9039,13 @@ impl Host {
                 crate::compose::view(&over_desc)?,
             ))
         });
-        let format = if planes.is_some() {
+        let format = if let Some(format) = swap_format(desc.Format) {
+            format
+        } else if planes.is_some() {
             DXGI_FORMAT_R8G8B8A8_UNORM
         } else {
-            let Some(format) = swap_format(desc.Format) else {
-                tracing::warn!(format = desc.Format.0, "cannot present this format");
-                return None;
-            };
-            format
+            tracing::warn!(format = desc.Format.0, "cannot present this format");
+            return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());

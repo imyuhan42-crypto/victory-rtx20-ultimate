@@ -181,9 +181,12 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
         return (16, 512);
     };
     let budget_mb = budget_bytes >> 20;
+    const SIX_HALF_GIB_MB: u64 = 6 * 1024 + 512;
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
-    if budget_mb <= TWELVE_GIB_MB {
+    if budget_mb <= SIX_HALF_GIB_MB {
+        (4, 384)
+    } else if budget_mb <= TWELVE_GIB_MB {
         (16, 512)
     } else if budget_mb < TWENTY_GIB_MB {
         (4, 2048)
@@ -2810,24 +2813,25 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
-            return;
+            Vec::new()
+        } else {
+            let idle: Vec<(u64, u64)> = map
+                .iter()
+                .filter(|(_, s)| {
+                    Arc::strong_count(s) == 1
+                        && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                        && crate::host::references(&s.buffer) == 1
+                })
+                .map(|(key, _)| *key)
+                .collect();
+            idle.into_iter().filter_map(|key| map.remove(&key)).collect()
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        let idle: Vec<(u64, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(key, _)| *key)
-            .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -2841,6 +2845,43 @@ pub(crate) fn let_go_idle() {
         // Nothing runs now and nothing names it: freed at once unless a
         // submission is running after all.
         crate::host::retire(shadow);
+    }
+
+    // Reclaim idle registered buffer shadows that are unreferenced by any list,
+    // descriptor slot, or in-flight write, without dirtying BUFFERS_CHANGED unless
+    // at least one entry actually qualifies.
+    let can_evict = |s: &Arc<Shadow>| {
+        Arc::strong_count(s) == 1
+            && !s.writes_pending()
+            && s.card_dirty_now().is_empty()
+            && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+            && crate::host::references(&s.buffer) == 1
+    };
+    let any_idle = buffers_read().values().any(|e| e.shadow.as_ref().is_some_and(can_evict));
+    if any_idle {
+        let taken: Vec<Arc<Shadow>> = {
+            let mut map = buffers();
+            map.values_mut()
+                .filter_map(|e| {
+                    if e.shadow.as_ref().is_some_and(can_evict) {
+                        e.shadow.take()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        if !taken.is_empty() {
+            let (went, bytes) = (taken.len(), taken.iter().map(|s| s.len).sum::<u64>());
+            crate::host::trail(|| {
+                format!("sweep: {went} host copies of idle buffers let go ({} KiB)", bytes >> 10)
+            });
+            for shadow in taken {
+                LET_GO[0].fetch_add(1, Ordering::Relaxed);
+                LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
+                crate::host::retire(shadow);
+            }
+        }
     }
 }
 
@@ -5434,8 +5475,10 @@ mod window_tests {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
 
-        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        // Unknown (WARP / query failure) and >6.5..=12 GiB keep the 12 GB baseline;
+        // <= 6.5 GiB scales tighter for 6 GB RTX 20-series cards.
         assert_eq!(default_card_limits_mb(None), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(6 * GIB)), (4, 384));
         assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));

@@ -227,16 +227,49 @@ extern "system" fn create_queue(
     )
 }
 
+fn default_staging_floor_mb(total_phys_bytes: Option<u64>) -> u64 {
+    const GIB: u64 = 1 << 30;
+    match total_phys_bytes {
+        Some(total) if total > 0 && total <= 16 * GIB => 128,
+        _ => 256,
+    }
+}
+
+fn physical_ram_bytes() -> Option<u64> {
+    let mut status = windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    // SAFETY: valid initialized MEMORYSTATUSEX struct pointer.
+    (unsafe { windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx(&mut status) } != 0)
+        .then_some(status.ullTotalPhys)
+}
+
+fn with_scratch_buf<T>(len: usize, f: impl FnOnce(&mut [u8]) -> T) -> T {
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.resize(len, 0);
+        let result = f(&mut buf[..len]);
+        if buf.capacity() > (8 << 20) && len < (512 << 10) {
+            buf.shrink_to(512 << 10);
+        }
+        result
+    })
+}
+
 /// The title asks for 32 MiB and stops if this fails. Give PC worker threads
-/// enough staging headroom (default 256 MiB) so multi-MB RPF chunks don't
-/// starve the remaining cores.
+/// enough staging headroom (256 MiB on >16 GB RAM, 128 MiB on <=16 GB RAM) so
+/// multi-MB RPF chunks don't starve the remaining cores without excess commit.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     static FLOOR_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let floor = *FLOOR_MB.get_or_init(|| {
         std::env::var("VICTORY_DSTORAGE_STAGING_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(256)
+            .unwrap_or_else(|| default_staging_floor_mb(physical_ram_bytes()))
     }) << 20;
     tracing::info!(size, floor, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
@@ -1409,20 +1442,24 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+    if bc != 0 && options & ZLIB != 0 {
+        let tables = tables.as_ref().expect("tables computed when bc != 0");
+        with_scratch_buf(request.intermediate_size as usize, |packed| {
+            let n = inflate(&source, packed).map_err(|hr| fail(hr, "zlib"))?;
+            into_destination(request, size, |out| {
+                bcpack::decode(bc, &packed[..n], out, tables)
+                    .map(|()| out.len())
+                    .map_err(|e| fail(INVALID_DATA, &e.to_string()))
+            })
+        })?;
     } else {
-        source
-    };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+        into_destination(request, size, |out| match tables {
+            Some(tables) => bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        })?;
+    }
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -1656,44 +1693,45 @@ fn into_pages(
         super::xmem::pages_written(pages, offset, len);
         return filled;
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
-    // A page the title has just made, or a view the host refuses for a moment (commit
-    // or address space short while a load maps many at once), can come right a little
-    // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
-    // about 1.5 s in all).
-    static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
-    });
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
-    let mut tries = 0;
-    while !written && tries < retries {
-        std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
-        tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
-    }
-    if written {
-        super::xmem::pages_written(pages, offset, n);
-        if tries > 0 {
-            tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
+    with_scratch_buf(len, |data| {
+        let n = fill(data)?;
+        // A page the title has just made, or a view the host refuses for a moment (commit
+        // or address space short while a load maps many at once), can come right a little
+        // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
+        // about 1.5 s in all).
+        static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let retries = *RETRIES.get_or_init(|| {
+            std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
+        });
+        let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+        let mut tries = 0;
+        while !written && tries < retries {
+            std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
+            tries += 1;
+            written = super::xmem::write_physical(pages, offset, &data[..n]);
         }
-        Ok(())
-    } else {
-        let known = super::xmem::pages_known(pages, offset, len);
-        tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
-    }
+        if written {
+            super::xmem::pages_written(pages, offset, n);
+            if tries > 0 {
+                tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
+            }
+            Ok(())
+        } else {
+            let known = super::xmem::pages_known(pages, offset, len);
+            tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
+            // Said aloud: the title never reads a request's result
+            // (it only polls for completion), so a destination left unwritten
+            // is a model or texture that silently holds whatever its pages
+            // held before.
+            tracing::warn!(
+                offset,
+                len,
+                pages = pages.len(),
+                "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+            );
+            Err(E_INVALIDARG)
+        }
+    })
 }
 
 /// The page numbers `list` holds now, one per 64 KiB of destination.
@@ -2551,5 +2589,13 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn staging_floor_scales_with_physical_ram() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(default_staging_floor_mb(None), 256);
+        assert_eq!(default_staging_floor_mb(Some(16 * GIB)), 128);
+        assert_eq!(default_staging_floor_mb(Some(32 * GIB)), 256);
     }
 }

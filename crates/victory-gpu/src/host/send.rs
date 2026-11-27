@@ -120,7 +120,20 @@ static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    let limited = crate::residency::limited_host_ram();
+    if on_card() {
+        if limited { 128 << 20 } else { 256 << 20 }
+    } else if limited {
+        256 << 20
+    } else {
+        512 << 20
+    }
+}
+
+/// Drops spare upload buffers held idle when host memory is pressured.
+pub(crate) fn trim_spare() {
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    spare.clear();
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -198,13 +211,35 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
-    for (_, ranges) in dirty {
+    let mut total_runs = 0usize;
+    let mut chunk_spans: Vec<(usize, usize, usize, usize, u64)> = Vec::new();
+    for (dirty_idx, (_, ranges)) in dirty.iter().enumerate() {
         let mut runs = Vec::new();
-        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
-            runs.push((a, at, b - a));
-            at += ((b - a) as u64).next_multiple_of(16);
+        let mut words = 0usize;
+        let mut chunk_words = 0usize;
+        let mut chunk_start = 0usize;
+        let mut chunk_offset = at;
+        for (idx, &(a, b)) in ranges.iter().enumerate() {
+            if !short(&(a, b)) {
+                runs.push((a, at, b - a));
+                at += ((b - a) as u64).next_multiple_of(16);
+            } else {
+                let w = (b - a) / 4;
+                if w > 0 && chunk_words == 0 {
+                    chunk_offset = at + words as u64 * 8;
+                }
+                words += w;
+                chunk_words += w;
+            }
+            if idx + 1 - chunk_start == RUNS_AT_A_TIME || idx + 1 == ranges.len() {
+                if chunk_words > 0 {
+                    chunk_spans.push((dirty_idx, chunk_start, idx + 1, chunk_words, chunk_offset));
+                    chunk_words = 0;
+                }
+                chunk_start = idx + 1;
+            }
         }
-        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+        total_runs += runs.len();
         copies.push(Copy { runs, pairs: (at, words as u32) });
         at += (words as u64 * 8).next_multiple_of(16);
     }
@@ -212,20 +247,17 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
         return None;
     }
     let memory = memory(host, at)?;
-    let mut moves: Vec<(usize, usize, usize)> = Vec::new();
-    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
-    for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
+    let mut moves: Vec<(usize, usize, usize)> = Vec::with_capacity(total_runs);
+    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::with_capacity(chunk_spans.len());
+    for ((shadow, _), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
-        // (80,000 runs of some words a frame: in pieces of work.)
-        let mut to = memory.data + copy.pairs.0 as usize;
-        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
-            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-            if words > 0 {
-                work.push((from, ranges, to));
-                to += words * 8;
-            }
-        }
+    }
+    for (dirty_idx, start_idx, end_idx, _chunk_words, rel_to) in chunk_spans {
+        let (shadow, ranges) = &dirty[dirty_idx];
+        let from = shadow.card_data() as usize;
+        let to = memory.data + rel_to as usize;
+        work.push((from, &ranges[start_idx..end_idx], to));
     }
     let one = |i: usize| {
         let (from, ranges, to) = work[i];

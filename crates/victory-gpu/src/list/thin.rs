@@ -52,10 +52,19 @@ pub(crate) fn on() -> bool {
     })
 }
 
-/// Whether it is asked for.
+/// Whether it is asked for (`VICTORY_THIN=1` default outside tests, `=0` disables).
 pub(crate) fn wanted() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        #[cfg(test)]
+        {
+            std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1")
+        }
+        #[cfg(not(test))]
+        {
+            std::env::var_os("VICTORY_THIN").is_none_or(|v| v != "0")
+        }
+    })
 }
 
 /// What a title list keeps: the recording being written and the words of it
@@ -300,7 +309,12 @@ fn back_list(kind: u32) -> This {
 }
 
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    let default_threads = std::thread::available_parallelism().map_or(4usize, |n| (n.get() / 2).clamp(4, 8));
+    let threads = std::env::var("VICTORY_THIN_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default_threads)
+        .clamp(1, 32);
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");

@@ -338,7 +338,16 @@ const WINDOW_MOST: u64 = 64;
 /// before, at the next submission.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        #[cfg(test)]
+        {
+            std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")
+        }
+        #[cfg(not(test))]
+        {
+            std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0")
+        }
+    })
 }
 
 /// Whether indirect executions of one record are clamped in batches
@@ -370,10 +379,17 @@ fn windows() -> bool {
 /// to wait that do not pass through its lists' methods is not known.
 fn batches() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
-        Ok("0") => 0,
-        Ok("2") => 2,
-        _ => 1,
+    *ON.get_or_init(|| {
+        #[cfg(test)]
+        let default = 1;
+        #[cfg(not(test))]
+        let default = 2;
+        match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
+            Ok("0") => 0,
+            Ok("1") => 1,
+            Ok("2") => 2,
+            _ => default,
+        }
     })
 }
 
@@ -1484,16 +1500,13 @@ impl State {
                 continue;
             }
             count = slot + 1;
-            if v.address == 0 || v.size == 0 {
-                continue;
-            }
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+            let Some((shadow, bound)) = resolve_geometry_shadow(v.address, v.size) else {
                 continue;
             };
-            shadow.refresh(list, v.address, u64::from(v.size));
+            shadow.refresh(list, v.address, u64::from(bound));
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
+                SizeInBytes: bound,
                 StrideInBytes: v.stride,
             };
         }
@@ -1505,13 +1518,13 @@ impl State {
         }
         if indexed {
             let v = self.index;
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+            let Some((shadow, bound)) = resolve_geometry_shadow(v.address, v.size) else {
                 return false;
             };
-            shadow.refresh(list, v.address, u64::from(v.size));
+            shadow.refresh(list, v.address, u64::from(bound));
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
+                SizeInBytes: bound,
                 Format: DXGI_FORMAT(v.format as i32),
             };
             // SAFETY: an open list; the view names a live host buffer.
@@ -4032,21 +4045,153 @@ impl State {
                 // the read (see `crate::watch::title_memory_reading`): while
                 // the world streams a change is under way most of the time,
                 // and this is the thread that submits.
-                let mut read = vec![0u8; n * 3 * stride];
-                let held = (!crate::host::read_into(from as *const u8, &mut read)).then(crate::watch::title_memory_reading);
-                // SAFETY: the vertices lie in a title buffer (checked when
-                // recorded) and the scratch memory is the list's.
-                let (src, dst) = unsafe {
-                    (
-                        if held.is_some() { std::slice::from_raw_parts(from as *const u8, n * 3 * stride) } else { &read[..] },
-                        std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
-                    )
-                };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
+                let bytes = n * 3 * stride;
+                with_rect_scratch(bytes, |read| {
+                    let held = (!crate::host::read_into(from as *const u8, read))
+                        .then(crate::watch::title_memory_reading);
+                    // SAFETY: the vertices lie in a title buffer (checked when
+                    // recorded) and the scratch memory is the list's.
+                    let (src, dst) = unsafe {
+                        (
+                            if held.is_some() {
+                                std::slice::from_raw_parts(from as *const u8, bytes)
+                            } else {
+                                &read[..]
+                            },
+                            std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
+                        )
+                    };
+                    crate::primitive::expand_rects(src, dst, stride, &elements);
+                });
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
                 SizeInBytes: (rects * 6 * stride as u64) as u32,
+                StrideInBytes: v.stride,
+            };
+            // SAFETY: an open list; the view names live scratch memory.
+            unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+        }
+        true
+    }
+
+    /// Expands indexed `RECTANGLES` draws on the CPU when the pipeline lacks
+    /// the rectangle geometry stage (`self.index` holds `R16_UINT` or `R32_UINT` triples).
+    fn indexed_rectangles(&self, list: &HostList, count: u32, first: u32, base: i32) -> bool {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        let rects = u64::from(count / 3);
+        if rects == 0 {
+            return false;
+        }
+        let elem_bytes: u64 = match self.index.format {
+            57 => 2, // DXGI_FORMAT_R16_UINT
+            42 => 4, // DXGI_FORMAT_R32_UINT
+            _ => return false,
+        };
+        let idx = self.index;
+        let Some(idx_end) = u64::from(first).checked_add(rects * 3).and_then(|v| v.checked_mul(elem_bytes)) else {
+            return false;
+        };
+        if idx.address == 0
+            || idx_end > u64::from(idx.size)
+            || crate::shadow::find_any(idx.address + u64::from(first) * elem_bytes, rects * 3 * elem_bytes).is_none()
+        {
+            once!("indexed rectangle indices outside their buffer");
+            return false;
+        }
+        let idx_from = (idx.address + u64::from(first) * elem_bytes) as usize;
+        let idx_len = (rects * 3 * elem_bytes) as usize;
+        let index_format = idx.format;
+
+        for slot in 0..32 {
+            let elements: Vec<(u32, u32)> = p
+                .inputs
+                .iter()
+                .filter(|e| e.slot == slot && !e.per_instance)
+                .map(|e| (e.offset, e.format))
+                .collect();
+            if elements.is_empty() {
+                continue;
+            }
+            let v = self.vertex[slot as usize];
+            let stride = u64::from(v.stride);
+            let Some((_, vb_bound)) = resolve_geometry_shadow(v.address, v.size) else {
+                once!(slot, "indexed rectangle vertices outside their buffer");
+                return false;
+            };
+            if stride == 0 || u64::from(vb_bound) < stride {
+                once!(slot, "indexed rectangle vertex stride invalid");
+                return false;
+            }
+            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+                return false;
+            };
+            let to = to as usize;
+            let vb_from = v.address as usize;
+            let vb_len = vb_bound as usize;
+            let stride_usize = stride as usize;
+            let max_verts = vb_len / stride_usize;
+            let n = rects as usize;
+            list.defer_host_read(idx_from, idx_len, move || {
+                with_rect_idx_scratch(idx_len, |idx_bytes| {
+                    let held_idx = (!crate::host::read_into(idx_from as *const u8, idx_bytes))
+                        .then(crate::watch::title_memory_reading);
+                    let indices = if held_idx.is_some() {
+                        // SAFETY: index range checked when recorded.
+                        unsafe { std::slice::from_raw_parts(idx_from as *const u8, idx_len) }
+                    } else {
+                        &idx_bytes[..]
+                    };
+                    with_rect_scratch(n * 3 * stride_usize, |gathered| {
+                        gathered.fill(0);
+                        for rect_i in 0..n {
+                            for corner in 0..3 {
+                                let k = rect_i * 3 + corner;
+                                let raw_idx = if index_format == 57 {
+                                    i64::from(u16::from_le_bytes([indices[k * 2], indices[k * 2 + 1]]))
+                                } else {
+                                    i64::from(u32::from_le_bytes([
+                                        indices[k * 4],
+                                        indices[k * 4 + 1],
+                                        indices[k * 4 + 2],
+                                        indices[k * 4 + 3],
+                                    ]))
+                                };
+                                let resolved = raw_idx + i64::from(base);
+                                if resolved >= 0 && (resolved as usize) < max_verts {
+                                    let src_off = (resolved as usize) * stride_usize;
+                                    let dst_off = k * stride_usize;
+                                    if !crate::host::read_into(
+                                        (vb_from + src_off) as *const u8,
+                                        &mut gathered[dst_off..dst_off + stride_usize],
+                                    ) {
+                                        let _held_vb = crate::watch::title_memory_reading();
+                                        // SAFETY: vertex range validated within resolved shadow bounds.
+                                        let src = unsafe {
+                                            std::slice::from_raw_parts(
+                                                (vb_from + src_off) as *const u8,
+                                                stride_usize,
+                                            )
+                                        };
+                                        gathered[dst_off..dst_off + stride_usize]
+                                            .copy_from_slice(src);
+                                    }
+                                }
+                            }
+                        }
+                        // SAFETY: scratch buffer holds `n * 6 * stride_usize` bytes.
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride_usize)
+                        };
+                        crate::primitive::expand_rects(gathered, dst, stride_usize, &elements);
+                    });
+                });
+            });
+            let view = D3D12_VERTEX_BUFFER_VIEW {
+                BufferLocation: gpu,
+                SizeInBytes: (rects * 6 * stride) as u32,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -4067,21 +4212,25 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
-        // Indexed rectangles are drawn by the rectangle geometry stage
-        // alone (nothing expands them on the CPU).
-        let lost = self.topology == RECTANGLES && !self.completes_rects();
-        if lost {
-            once!("indexed rectangles not drawn");
-        }
-        let ran = !lost && self.prepare(list, true);
+        let rects = self.topology == RECTANGLES && !self.completes_rects();
+        let ready = self.prepare(list, !rects);
+        let ran = ready && (!rects || self.indexed_rectangles(list, indices, first, base));
         if ran {
-            #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
-            // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawIndexedInstanced(indices, instances, first, base, first_instance)
-            };
+            if rects {
+                let count = indices / 3 * 6;
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text(format!("indexed rects {count}x{instances}"), false));
+                // SAFETY: an open list with expanded rectangle scratch VBs set.
+                unsafe { list.list.DrawInstanced(count, instances, 0, first_instance) };
+            } else {
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+                // SAFETY: an open list with everything set.
+                unsafe {
+                    list.list
+                        .DrawIndexedInstanced(indices, instances, first, base, first_instance)
+                };
+            }
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4858,6 +5007,48 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
     }
+}
+
+/// Resolves and clamps a geometry buffer range against its resolved host shadow.
+fn resolve_geometry_shadow(
+    address: u64,
+    size: u32,
+) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u32)> {
+    if address == 0 || size == 0 {
+        return None;
+    }
+    let shadow = crate::shadow::find_any(address, u64::from(size))
+        .or_else(|| crate::shadow::find_any(address, 1))?;
+    let bound = size.min(u32::try_from(shadow.left(address)).unwrap_or(u32::MAX));
+    (bound > 0).then_some((shadow, bound))
+}
+
+fn with_rect_scratch(len: usize, f: impl FnOnce(&mut [u8])) {
+    thread_local! {
+        static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.resize(len, 0);
+        f(&mut buf[..len]);
+        if buf.capacity() > (4 << 20) && len < (256 << 10) {
+            buf.shrink_to(256 << 10);
+        }
+    });
+}
+
+fn with_rect_idx_scratch(len: usize, f: impl FnOnce(&mut [u8])) {
+    thread_local! {
+        static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.resize(len, 0);
+        f(&mut buf[..len]);
+        if buf.capacity() > (1 << 20) && len < (64 << 10) {
+            buf.shrink_to(64 << 10);
+        }
+    });
 }
 
 /// Per-frame texture staging byte budget scaled from the adapter's local VRAM

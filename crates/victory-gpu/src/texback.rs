@@ -155,10 +155,11 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
     let mut rows = vec![0u32; n];
     let mut total = 0u64;
+    let fp_desc = crate::resource::footprint_desc(desc);
     // SAFETY: out arrays of `n` entries.
     unsafe {
         host.device.GetCopyableFootprints(
-            &desc,
+            &fp_desc,
             0,
             subresources,
             0,

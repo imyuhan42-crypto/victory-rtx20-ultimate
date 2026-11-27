@@ -76,10 +76,17 @@ use crate::shadow::Shadow;
 /// made from older bytes is made again. This is why stage 2 is its own.
 pub(super) fn stage() -> u32 {
     static STAGE: OnceLock<u32> = OnceLock::new();
-    *STAGE.get_or_init(|| match std::env::var("VICTORY_CARD_STEPS").ok().as_deref() {
-        Some("1") => 1,
-        Some("2") => 2,
-        _ => 0,
+    *STAGE.get_or_init(|| {
+        #[cfg(test)]
+        let default = 0;
+        #[cfg(not(test))]
+        let default = 2;
+        match std::env::var("VICTORY_CARD_STEPS").ok().as_deref() {
+            Some("0") => 0,
+            Some("1") => 1,
+            Some("2") => 2,
+            _ => default,
+        }
     })
 }
 
